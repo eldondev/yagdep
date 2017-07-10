@@ -1,21 +1,31 @@
 package main
 
+import "encoding/json"
 import "net"
 import "io"
+import "io/ioutil"
 import "log"
 import "bufio"
 import "bytes"
 import "encoding/binary"
+import "os"
+import "strings"
 
 type RRecord struct {
-	Name []string
+	RecordBuffer []byte
 	RRecordFooter
-	NameBuffer []byte
+	Name []string
 }
 
 type RRecordFooter struct {
 	Type  uint16
 	Class uint16
+}
+
+type AnswerRecord struct {
+	TTL uint32
+	Length uint16
+	Address [4]byte
 }
 
 type DNSPacketHeader struct {
@@ -29,7 +39,32 @@ type DNSPacketHeader struct {
 
 type Request struct {
 	DNSPacketHeader
-	records []RRecord
+	Records []RRecord
+}
+
+type Response struct {
+	Request
+	AnswerRecords []AnswerRecord
+}
+
+type Config struct {
+	Hosts map[string][]net.IP
+}
+
+var config Config
+
+func init() {
+	var err error
+	var file *os.File
+	var config_json []byte
+	if file, err = os.Open("config.json"); err == nil {
+		if config_json, err = ioutil.ReadAll(file); err == nil {
+			if err = json.Unmarshal(config_json, &config); err == nil {
+				return
+			}
+		}
+	}
+	log.Fatalf("Fatal: %v", err)
 }
 
 func (d *DNSPacketHeader) total_records() int {
@@ -44,10 +79,10 @@ func (record *RRecord) read_record_names(name_reader *bufio.Reader) (err error) 
 			if err == io.EOF {
 				break
 			}
-			log.Fatalf("%+v", err)
+			return err
 		}
 		if name, err = name_reader.Peek(int(name_length)); err != nil {
-			log.Fatalf("%+v", err)
+			return err
 		}
 		name_reader.Discard(int(name_length))
 		record.Name = append(record.Name, string(name))
@@ -56,56 +91,92 @@ func (record *RRecord) read_record_names(name_reader *bufio.Reader) (err error) 
 }
 
 func (request *Request) read_record(packet_reader *bufio.Reader) (err error) {
-	for record_index := 0; record_index < request.total_records(); record_index++ {
-		record := RRecord{}
-		var name []byte
-		var err error
-		if name, err = packet_reader.ReadBytes('\x00'); err != nil {
-			log.Fatalf("%+v", err)
-		}
-		name_reader := bufio.NewReader(bytes.NewReader(name))
-		record.read_record_names(name_reader)
-		err = binary.Read(packet_reader, binary.BigEndian, &record.RRecordFooter)
-		request.records = append(request.records, record)
-		if err != nil {
-			log.Fatalf("%+v", err)
-		}
+	record := RRecord{}
+	if record.RecordBuffer, err = packet_reader.ReadBytes('\x00'); err != nil {
+		return err
 	}
+	name_reader := bufio.NewReader(bytes.NewReader(record.RecordBuffer))
+	record.read_record_names(name_reader)
+	err = binary.Read(packet_reader, binary.BigEndian, &record.RRecordFooter)
+	request.Records = append(request.Records, record)
 	return
 }
 
-func respond(request Request, requester net.Addr) (err error) {
-	return nil
+func (response *Response) valid() bool {
+	return response.Flags[0] == 1 && (response.Flags[1]  | 0x20 == 0x20) && response.total_records() >= 1 && response.Records[0].Type == 1 && response.Records[0].Class == 1 
+ 
 }
 
-func serve(byte_count int, requester net.Addr, packet []byte) (err error) {
+func (response *Response) populate() {
+	answers, ok := config.Hosts[strings.Join(response.Records[0].Name, ".")] // Look up our name
+	if ok && response.valid() { // A standard query for which we have answers
+		response.Flags[0], response.Flags[1] = 129, 128 // Set "we have answers" flags
+		response.Answers = uint16(len(answers))
+		for _, address := range(answers) {
+			address_bytes := []byte(address.To4());
+			response.AnswerRecords = append(response.AnswerRecords, AnswerRecord{TTL:300, Length: 4,  Address:[4]byte{address_bytes[0],address_bytes[1],address_bytes[2],address_bytes[3]}})
+		}
+	} else {
+		response.Flags[0], response.Flags[1] = 129, 131 // Set "We do not have any record of that name" flags
+		response.Authorities = 0
+		response.Additionals = 0
+	}
+	response.Authorities = 0
+	response.Additionals = 0
+}
+
+func (response Response) format(request Request) (packet []byte) {
+	var response_packet bytes.Buffer
+	response.Request = request // Copy fields to start
+	response.populate()
+	binary.Write(&response_packet, binary.BigEndian, response.DNSPacketHeader)
+	for _, record := range(response.Records) {
+		if record.Class != 1 || record.Type != 1 {
+			continue;
+		}
+		response_packet.Write(record.RecordBuffer)
+		binary.Write(&response_packet, binary.BigEndian, record.RRecordFooter)
+	}
+	for _, answer := range(response.AnswerRecords) {
+		response_packet.Write([]byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01}) // A reference to the offset and type of the name we are responding to because our requests are very specific
+		binary.Write(&response_packet, binary.BigEndian, answer)
+	}
+	log.Printf("%+v", response_packet.Bytes());
+	return response_packet.Bytes()
+}
+
+func respond(request Request, requester *net.UDPAddr, conn *net.UDPConn) (err error) {
+	_, err = conn.WriteToUDP(Response{}.format(request), requester)
+	return
+}
+
+func serve(byte_count int, requester *net.UDPAddr, packet []byte, conn *net.UDPConn) {
+	var err error
 	request := Request{}
 	packet_reader := bufio.NewReader(bytes.NewReader(packet))
 	if err = binary.Read(packet_reader, binary.BigEndian, &request.DNSPacketHeader); err == nil {
 		request.read_record(packet_reader)
-		err = respond(request, net.Addr)
+		err = respond(request, requester, conn)
 	}
 	if err != nil {
-		log.Fatalf("%+v", err)
 		log.Println("binary.Read failed:", err)
 	}
-	return
 }
 
 func main() {
 	log.SetFlags(log.Flags() | log.Llongfile)
 	server, err := net.ListenUDP("udp", &net.UDPAddr{Port: 53})
 	if err != nil {
-		log.Fatalf("%+v", err)
+		log.Fatalf("Failed to listen on socket", err)
 	}
-	packet := make([]byte, 65507)
 	for {
 		var byte_count int
-		var requester net.Addr
-		byte_count, requester, err = server.ReadFrom(packet)
+		var requester *net.UDPAddr
+		packet := make([]byte, 65507)
+		byte_count, requester, err = server.ReadFromUDP(packet)
 		if err != nil {
 			log.Fatalf("%+v", err)
 		}
-		serve(byte_count, requester, packet)
+		go serve(byte_count, requester, packet, server)
 	}
 }
